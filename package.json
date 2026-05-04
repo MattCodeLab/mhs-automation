@@ -1,0 +1,15 @@
+{
+  "name": "mhs-automation",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.2-r.1"
+  }
+}
