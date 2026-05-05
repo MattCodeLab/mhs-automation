@@ -195,64 +195,108 @@ def _extract_headers(raw: pd.DataFrame, data_start: int) -> list[str]:
     if data_start == 0:
         return [f"col_{i}" for i in range(n_cols)]
 
-    # Collect non-NaN text paths per column (skip table-ID-like texts)
+    header_orig = raw.iloc[:data_start]
+
+    # For each column find the first row that has a meaningful original value.
+    # Columns with an early anchor should not inherit ffill from later rows.
+    first_own_row: dict[int, int] = {}
+    for col_idx in range(n_cols):
+        for row_idx in range(data_start):
+            val = header_orig.iloc[row_idx, col_idx]
+            if pd.notna(val):
+                s = str(val).strip()
+                if not _TABLE_ID_RE.match(s) and _clean_text(s):
+                    first_own_row[col_idx] = row_idx
+                    break
+
+    # Forward-fill each header row left-to-right so merged-cell spans propagate,
+    # but block propagation into columns whose own header appears in an earlier row
+    # (those columns are "anchored" at that level and don't belong to the sub-group
+    # currently being propagated).
+    ffilled: list[list] = []
+    for row_idx in range(data_start):
+        row = list(header_orig.iloc[row_idx])
+        last_val = None
+        for col_idx in range(n_cols):
+            if pd.notna(row[col_idx]):
+                last_val = row[col_idx]
+            elif last_val is not None:
+                col_anchor = first_own_row.get(col_idx)
+                if col_anchor is None or col_anchor > row_idx:
+                    row[col_idx] = last_val
+        ffilled.append(row)
+    header_block = pd.DataFrame(ffilled, columns=header_orig.columns)
+
+    # Build a text path per column from top header row down to the row above data.
+    # Skip table-ID tokens; skip consecutive duplicate labels within a path.
     paths: list[list[str]] = []
     for col_idx in range(n_cols):
         path: list[str] = []
+        prev = None
         for row_idx in range(data_start):
-            val = raw.iloc[row_idx, col_idx]
+            val = header_block.iloc[row_idx, col_idx]
             if pd.notna(val):
                 raw_str = str(val).strip()
                 if _TABLE_ID_RE.match(raw_str):
-                    continue          # skip "1.1", "3.6.19", etc.
+                    continue
                 text = _clean_text(raw_str)
-                if text:
+                if text and text != prev:
                     path.append(text)
+                    prev = text
         paths.append(path)
 
-    # Forward-fill: empty path inherits nearest left neighbour's path
-    for col_idx in range(1, n_cols):
-        if not paths[col_idx] and col_idx > 0:
-            paths[col_idx] = paths[col_idx - 1][:]
+    # Count how many times each leaf label appears — generic leaves that appear
+    # more than once must include parent context to stay unambiguous.
+    from collections import Counter
+    leaf_freq: Counter = Counter(
+        _col_name(p[-1]) for p in paths if p
+    )
 
-    # Assign names with deduplication
+    # Assign names: resolve duplicates by climbing the path until a unique suffix is found.
+    # Generic leaves that appear multiple times start at depth 2 (include parent).
     names: list[str] = []
-    used:  dict[str, int] = {}
+    used:  set[str] = set()
 
     for i, path in enumerate(paths):
         if not path:
-            base = f"col_{i}"
+            name = _unique_name(f"col_{i}", used)
         else:
             leaf = _col_name(path[-1])
-            # If single-word leaf is too generic, prepend parent for context
-            if leaf in _GENERIC_LABELS and len(path) >= 2:
-                base = _col_name(path[-2] + "_" + path[-1])
-            else:
-                base = leaf
-
-        if base not in used:
-            used[base] = 0
-            names.append(base)
-        else:
-            # Try parent + leaf combination
-            candidate = (
-                _col_name(paths[i][-2] + "_" + paths[i][-1])
-                if len(paths[i]) >= 2
-                else None
+            needs_context = (
+                leaf in _GENERIC_LABELS
+                and leaf_freq[leaf] > 1
+                and len(path) >= 2
             )
-            if candidate and candidate not in used:
-                used[candidate] = 0
-                names.append(candidate)
-            else:
-                used[base] += 1
-                names.append(f"{base}_{used[base]}")
+            min_depth = 2 if needs_context else 1
+
+            name = None
+            for depth in range(min_depth, len(path) + 1):
+                candidate = _col_name("_".join(path[-depth:]))
+                if candidate not in used:
+                    name = candidate
+                    break
+
+            if name is None:
+                name = _unique_name(_col_name("_".join(path)), used)
+
+        used.add(name)
+        names.append(name)
 
     return names
 
 
+def _unique_name(base: str, used: set) -> str:
+    if base not in used:
+        return base
+    n = 1
+    while f"{base}_{n}" in used:
+        n += 1
+    return f"{base}_{n}"
+
+
 _GENERIC_LABELS = frozenset({
     "total", "jumlah", "amount", "value", "number", "others", "other",
-    "lain", "subtotal", "percentage", "peratus", "ratio", "nisbah",
+    "lain", "lain_lain", "subtotal", "percentage", "peratus", "ratio", "nisbah",
 })
 
 

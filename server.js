@@ -132,38 +132,108 @@ async function handleTable(_, tableName) {
 }
 
 async function handleSeries(_, tableName, params) {
-  // Return date + up to 8 numeric columns as a time series
-  // Optionally filter by frequency
   const freqFilter = params.get("freq");
 
-  // Discover numeric columns
-  const colRows = await queryObj(`
+  // Classify all columns
+  const colInfo = await queryObj(`
     SELECT column_name, data_type
     FROM information_schema.columns
-    WHERE table_name = '${tableName}'
-      AND table_schema = 'main'
-      AND column_name NOT IN ('date','frequency')
+    WHERE table_name = '${tableName}' AND table_schema = 'main'
     ORDER BY ordinal_position
   `);
 
-  const numericCols = colRows
-    .filter(r => /INT|FLOAT|DOUBLE|DECIMAL|BIGINT|HUGEINT/i.test(r.data_type))
-    .slice(0, 8)
-    .map(r => r.column_name);
+  const META = new Set(["date", "frequency"]);
+  const isNumeric = r => /INT|FLOAT|DOUBLE|DECIMAL|BIGINT|HUGEINT/i.test(r.data_type);
+  const dimCols = colInfo.filter(r => !META.has(r.column_name) && !isNumeric(r)).map(r => r.column_name);
+  const numCols = colInfo.filter(r => !META.has(r.column_name) &&  isNumeric(r)).map(r => r.column_name);
 
-  if (!numericCols.length) return json({ cols: [], rows: [] });
+  // ── Indicator / long-format tables (from wide parser) ──────────────────────
+  // These have an "indicator" string col + a single "value" numeric col.
+  // Pivot so each indicator becomes its own column.
+  if (dimCols.includes("indicator") && numCols.includes("value")) {
+    const freqCond = freqFilter ? `AND frequency = ${sqlLit(freqFilter)}` : "";
+    const indRows  = await queryObj(`
+      SELECT indicator, COUNT(*) AS cnt
+      FROM "${tableName}"
+      WHERE indicator IS NOT NULL ${freqCond}
+      GROUP BY indicator ORDER BY cnt DESC LIMIT 20
+    `);
+    const indicators = indRows.map(r => r.indicator);
+    if (!indicators.length) return json({ cols: [], rows: [], col_types: {}, col_labels: {} });
 
-  const colList = numericCols.map(c => `"${c}"`).join(", ");
-  const where   = freqFilter ? `WHERE frequency = '${freqFilter}'` : "";
+    const caseExprs = indicators.map((ind, i) =>
+      `MAX(CASE WHEN indicator = '${ind.replace(/'/g, "''")}' THEN value END) AS "ind_${i}"`
+    ).join(", ");
+    const where = freqFilter ? `WHERE frequency = ${sqlLit(freqFilter)}` : "";
+    const rows  = await queryObj(`
+      SELECT date::VARCHAR AS date, frequency, ${caseExprs}
+      FROM "${tableName}" ${where}
+      GROUP BY date, frequency ORDER BY date
+    `);
 
-  const rows = await queryObj(
-    `SELECT date::VARCHAR AS date, frequency, ${colList}
-     FROM "${tableName}"
-     ${where}
-     ORDER BY date`
-  );
+    const cols      = indicators.map((_, i) => `ind_${i}`);
+    const colLabels = Object.fromEntries(indicators.map((ind, i) => [`ind_${i}`, ind]));
+    const colTypes  = Object.fromEntries(indicators.map((ind, i) => [`ind_${i}`, inferDataType(ind)]));
+    return json({ cols, rows, col_types: colTypes, col_labels: colLabels });
+  }
 
-  return json({ cols: numericCols, rows });
+  // ── Standard wide-format tables ────────────────────────────────────────────
+  const conds = [];
+  if (freqFilter) conds.push(`frequency = ${sqlLit(freqFilter)}`);
+
+  // When a dimension column exists (sector, type, purpose…), filter to the
+  // aggregate "Total" row so one row per date reaches the chart.
+  if (dimCols.length > 0) {
+    const dimCol   = dimCols[0];
+    const totCheck = await queryObj(`
+      SELECT COUNT(*) AS cnt FROM "${tableName}"
+      WHERE LOWER("${dimCol}") LIKE '%total%' OR LOWER("${dimCol}") LIKE '%jumlah%'
+    `);
+    if (Number(totCheck[0].cnt) > 0) {
+      conds.push(`(LOWER("${dimCol}") LIKE '%total%' OR LOWER("${dimCol}") LIKE '%jumlah%')`);
+    }
+  }
+
+  const where     = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const selCols   = numCols.slice(0, 20);
+  if (!selCols.length) return json({ cols: [], rows: [], col_types: {}, col_labels: {} });
+
+  // MAX() aggregation de-duplicates any remaining rows for the same date.
+  const colList = selCols.map(c => `MAX("${c}") AS "${c}"`).join(", ");
+  const rows    = await queryObj(`
+    SELECT date::VARCHAR AS date, frequency, ${colList}
+    FROM "${tableName}" ${where}
+    GROUP BY date, frequency ORDER BY date
+  `);
+
+  const colTypes = Object.fromEntries(numCols.map(c => [c, inferDataType(c)]));
+  return json({ cols: selCols, rows, col_types: colTypes, col_labels: {} });
+}
+
+// ── data-type inference ───────────────────────────────────────────────────────
+
+function inferDataType(col) {
+  // Normalise: lower-case, collapse non-alphanumeric to underscores
+  const n = col.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+
+  // Volume / count
+  if (/^no_of|_no_of|^no_million|^no_000|number_of|_count$|^count_|^volume|_volume$|^num_of|transactions?$|principal_card|supplementary_card|polic|certif|cases_|cleared|returned/.test(n))
+    return "volume";
+
+  // Percentage / rate
+  if (/^ratio_|_ratio$|_ratio_|growth$|_growth$|_rate$|^rate_|yield|coverage|spread|adequacy|retention|_percent|_pct$|capital_adequacy|claims_ratio|bps|weighted/.test(n))
+    return "pct";
+
+  // RM / monetary
+  if (/outstanding|approved|disbursed|repaid|asset|liabilit|deposit|loan|financing|expenditure|reserve|debt|bond|sukuk|premium|claim|contribut|income|provision|impaired|npl|amount|balance|capital|raised|turnover|fund|^rm_|_rm_|_rm$/.test(n))
+    return "rm";
+
+  // Default: financial data is predominantly monetary
+  return "rm";
+}
+
+function sqlLit(s) {
+  return `'${String(s).replace(/'/g, "''")}'`;
 }
 
 function handleStatic(req) {
