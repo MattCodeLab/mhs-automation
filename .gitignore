@@ -37,3 +37,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 sample-excels
 src
 */__pycache__
+
+# Outputs
+*.csv
+*.json
+*.parquet
+*.duckdb
