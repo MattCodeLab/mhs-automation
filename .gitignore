@@ -38,8 +38,9 @@ sample-excels
 src
 */__pycache__
 
-# Outputs
 *.csv
-*.json
 *.parquet
+*.json
 *.duckdb
+*.xls
+*.xlsm

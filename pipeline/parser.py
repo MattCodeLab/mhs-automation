@@ -33,6 +33,18 @@ _MULTI_US_RE = re.compile(r"_+")
 # Separator tokens found in period columns (not actual period values)
 _PERIOD_SEP = frozenset({"*", "^", "-", "#", "P", "R", "E", "R/", "P/"})
 
+# Garbage / placeholder values that should become None in numeric columns.
+# Matches cells whose *entire* content is: dashes, slashes, backslashes, spaces,
+# dots, asterisks, pipes, carets, or well-known NA strings like "n/a", "object".
+_GARBAGE_RE = re.compile(
+    r"^[\s\-\\/\.\*\|\^~]+$"         # only punctuation / whitespace
+    r"|^n\.?a\.?$"                    # n/a, na, n.a.
+    r"|^nil$|^null$|^none$"           # nil / null / none
+    r"|^object$"                      # literal "object" (pandas dtype leak)
+    r"|^\-+\s*\-+$",                  # "- -", "-- --", etc.
+    re.IGNORECASE,
+)
+
 # Period-indicator sets
 _SEMI_ANNUAL  = frozenset({"1H", "2H"})
 _QUARTERLY    = frozenset({"1Q", "2Q", "3Q", "4Q"})
@@ -245,15 +257,15 @@ def _extract_headers(raw: pd.DataFrame, data_start: int) -> list[str]:
                     prev = text
         paths.append(path)
 
-    # Count how many times each leaf label appears — generic leaves that appear
-    # more than once must include parent context to stay unambiguous.
+    # Count how many times each leaf label appears.
     from collections import Counter
     leaf_freq: Counter = Counter(
         _col_name(p[-1]) for p in paths if p
     )
 
-    # Assign names: resolve duplicates by climbing the path until a unique suffix is found.
-    # Generic leaves that appear multiple times start at depth 2 (include parent).
+    # Assign names: resolve duplicates by climbing the path until a unique name is found.
+    # Generic leaves (total, subtotal, others, lain_lain, etc.) always start from the
+    # full path so they always carry parent context (e.g. indirect_tax_total, not just total).
     names: list[str] = []
     used:  set[str] = set()
 
@@ -262,12 +274,15 @@ def _extract_headers(raw: pd.DataFrame, data_start: int) -> list[str]:
             name = _unique_name(f"col_{i}", used)
         else:
             leaf = _col_name(path[-1])
-            needs_context = (
-                leaf in _GENERIC_LABELS
-                and leaf_freq[leaf] > 1
-                and len(path) >= 2
-            )
-            min_depth = 2 if needs_context else 1
+
+            if leaf in _GENERIC_LABELS and len(path) >= 2:
+                # Always use full path for generic labels so parent context is always present
+                min_depth = len(path)
+            elif leaf_freq[leaf] > 1 and len(path) >= 2:
+                # Non-generic duplicates: start from parent+leaf
+                min_depth = 2
+            else:
+                min_depth = 1
 
             name = None
             for depth in range(min_depth, len(path) + 1):
@@ -333,11 +348,14 @@ def _parse_standard(raw, year_col, data_start, data_end):
         drop_set.add(period_col_name)
     df = df.drop(columns=list(drop_set), errors="ignore")
 
-    # Coerce data columns to numeric where mostly numeric
+    # Coerce data columns to numeric where mostly numeric.
+    # First scrub garbage placeholder values (e.g. "- -", "\", "object") so
+    # they don't block coercion or contaminate the dtype of the column.
     meta = {"date", "frequency"}
     for c in df.columns:
         if c in meta:
             continue
+        df[c] = _scrub_garbage(df[c])
         coerced = pd.to_numeric(df[c], errors="coerce")
         if coerced.notna().sum() / max(len(df), 1) >= 0.3:
             df[c] = coerced
@@ -379,7 +397,7 @@ def _parse_quarterly_strings(raw, year_col, data_start, data_end):
     meta = {"date", "frequency"}
     for c in df.columns:
         if c not in meta:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df[c] = pd.to_numeric(_scrub_garbage(df[c]), errors="coerce")
 
     data_cols = [c for c in df.columns if c not in meta]
     if data_cols:
@@ -497,7 +515,7 @@ def _parse_daily(raw: pd.DataFrame):
     meta = {"date", "frequency"}
     for c in df.columns:
         if c not in meta:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df[c] = pd.to_numeric(_scrub_garbage(df[c]), errors="coerce")
 
     data_cols = [c for c in df.columns if c not in meta]
     if data_cols:
@@ -508,6 +526,22 @@ def _parse_daily(raw: pd.DataFrame):
 
 
 # ── core helpers ──────────────────────────────────────────────────────────────
+
+def _scrub_garbage(series: pd.Series) -> pd.Series:
+    """Replace cells whose entire content matches a garbage/placeholder pattern with NaN."""
+    def _is_garbage(v) -> bool:
+        if pd.isna(v):
+            return False
+        if isinstance(v, (int, float)):
+            return False
+        return bool(_GARBAGE_RE.match(str(v).strip()))
+
+    mask = series.apply(_is_garbage)
+    if mask.any():
+        series = series.copy()
+        series[mask] = float("nan")
+    return series
+
 
 def _extend_headers(headers: list[str], n_cols: int) -> list[str]:
     """Pad or truncate headers list to exactly n_cols entries."""
@@ -631,7 +665,9 @@ def _clean_text(s: str) -> str:
         text = text.split(" / ")[-1].strip()
 
     # Strip trailing footnote digits / punctuation, e.g. "M31" → "M3"
-    text = re.sub(r"[\d,]+\s*$", "", text).strip()
+    # Exception: RM denomination columns like "RM1", "RM5", "RM50" must keep their number.
+    if not re.match(r"^RM\d+$", text, re.IGNORECASE):
+        text = re.sub(r"[\d,]+\s*$", "", text).strip()
 
     return text
 
