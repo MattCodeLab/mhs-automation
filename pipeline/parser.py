@@ -38,10 +38,14 @@ _PERIOD_SEP = frozenset({"*", "^", "-", "#", "P", "R", "E", "R/", "P/"})
 # dots, asterisks, pipes, carets, or well-known NA strings like "n/a", "object".
 _GARBAGE_RE = re.compile(
     r"^[\s\-\\/\.\*\|\^~]+$"         # only punctuation / whitespace
-    r"|^n\.?a\.?$"                    # n/a, na, n.a.
-    r"|^nil$|^null$|^none$"           # nil / null / none
-    r"|^object$"                      # literal "object" (pandas dtype leak)
-    r"|^\-+\s*\-+$",                  # "- -", "-- --", etc.
+    r"|^n\.?a\.?$"                   # n/a, na, n.a.
+    r"|^nil$|^null$|^none$"          # nil / null / none
+    r"|^object$"                     # literal "object" (pandas dtype leak)
+    r"|^\-+\s*\-+$"                  # "- -", "-- --", etc.
+    r"|\\\-"                         # contains "\-" anywhere
+    r"|\-\\"                         # contains "-\" anywhere
+    r"|/-"                           # contains "/-" anywhere
+    r"|\.\.\.",                      # contains "..." anywhere
     re.IGNORECASE,
 )
 
